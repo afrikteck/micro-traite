@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""Micro Traité - interface GTK3 pour piloter une chaîne audio PipeWire.
+
+Chaîne : RNNoise -> Égaliseur -> Compresseur -> Limiteur
+Sortie : source virtuelle « Micro Traité » utilisable dans toutes les applis.
+
+Le programme génère ~/.config/pipewire/pipewire.conf.d/micro-prepro.conf
+puis recharge PipeWire. Usage :
+
+    micro-traite-gui              # interface graphique
+    micro-traite-gui --write-conf # écrit la conf sans interface (install)
+"""
+
+import json
+import os
+import subprocess
+import sys
+import gi
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, GLib
+
+HOME = os.path.expanduser("~")
+CONF_DIR = os.path.join(HOME, ".config", "pipewire", "pipewire.conf.d")
+CONF_PATH = os.path.join(CONF_DIR, "micro-prepro.conf")
+STATE_PATH = os.path.join(HOME, ".config", "micro-traite-gui.json")
+RNNOISE_PLUGIN = "/usr/lib/ladspa/librnnoise_ladspa.so"
+
+DEFAULTS = {
+    "input": "",
+    "noise": True, "vad": 50, "grace": 100,
+    "eq": True, "hp_freq": 80, "bass": 3.0, "mud": -3.0, "pres": 2.5,
+    "comp": True, "c_thr": -18, "c_ratio": 3.0, "c_att": 8, "c_rel": 150, "c_makeup": 2.0,
+    "limiter": True, "l_thr": -1.5,
+}
+
+
+def list_sources():
+    """Liste les micros disponibles (node.name, description) via PipeWire."""
+    try:
+        out = subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=5).stdout
+        data = json.loads(out)
+    except Exception:
+        return []
+    found = []
+    for obj in data:
+        props = obj.get("info", {}).get("props", {})
+        if props.get("media.class") != "Audio/Source":
+            continue
+        name = props.get("node.name", "")
+        if not name or name.startswith("micro-traite") or "monitor" in name:
+            continue
+        found.append((name, props.get("node.description", name)))
+    return found
+
+
+def load_state():
+    s = dict(DEFAULTS)
+    try:
+        with open(STATE_PATH) as f:
+            saved = json.load(f)
+        s.update({k: v for k, v in saved.items() if k in DEFAULTS})
+    except Exception:
+        pass
+    return s
+
+
+def resolve_input(s, sources=None):
+    sources = sources if sources is not None else list_sources()
+    names = [n for n, _ in sources]
+    if s.get("input") not in names:
+        s["input"] = names[0] if names else ""
+    return s["input"]
+
+
+def build_conf(s):
+    nodes, links, order = [], [], []
+
+    if s["noise"]:
+        nodes.append(
+            '                    { type = ladspa name = rnnoise '
+            f'plugin = "{RNNOISE_PLUGIN}" label = noise_suppressor_mono\n'
+            '                      control = {\n'
+            f'                        "VAD Threshold (%)" = {int(s["vad"])}.0\n'
+            f'                        "VAD Grace Period (ms)" = {int(s["grace"])}.0\n'
+            '                        "Retroactive VAD Grace (ms)" = 0.0\n'
+            '                      } }'
+        )
+        order.append(("rnnoise", "Output", "Input"))
+
+    if s["eq"]:
+        nodes.append(
+            '                    { type = builtin name = hp label = bq_highpass '
+            f'control = {{ "Freq" = {s["hp_freq"]}.0 "Q" = 0.707 }} }}'
+        )
+        nodes.append(
+            '                    { type = builtin name = bass label = bq_peaking '
+            f'control = {{ "Freq" = 110.0 "Q" = 0.7 "Gain" = {s["bass"]:.2f} }} }}'
+        )
+        nodes.append(
+            '                    { type = builtin name = mud label = bq_peaking '
+            f'control = {{ "Freq" = 350.0 "Q" = 1.2 "Gain" = {s["mud"]:.2f} }} }}'
+        )
+        nodes.append(
+            '                    { type = builtin name = pres label = bq_peaking '
+            f'control = {{ "Freq" = 2500.0 "Q" = 0.7 "Gain" = {s["pres"]:.2f} }} }}'
+        )
+        order += [("hp", "Out", "In"), ("bass", "Out", "In"),
+                  ("mud", "Out", "In"), ("pres", "Out", "In")]
+
+    if s["comp"]:
+        nodes.append(
+            '                    { type = ladspa name = comp '
+            'plugin = "/usr/lib/ladspa/sc4m_1916.so" label = sc4m\n'
+            '                      control = {\n'
+            '                        "RMS/peak" = 0.0\n'
+            f'                        "Attack time (ms)" = {int(s["c_att"])}.0\n'
+            f'                        "Release time (ms)" = {int(s["c_rel"])}.0\n'
+            f'                        "Threshold level (dB)" = {s["c_thr"]:.1f}\n'
+            f'                        "Ratio (1:n)" = {s["c_ratio"]:.1f}\n'
+            '                        "Knee radius (dB)" = 3.0\n'
+            f'                        "Makeup gain (dB)" = {s["c_makeup"]:.1f}\n'
+            '                      } }'
+        )
+        order.append(("comp", "Output", "Input"))
+
+    if s["limiter"]:
+        nodes.append(
+            '                    { type = ladspa name = limiter '
+            'plugin = "/usr/lib/ladspa/hard_limiter_1413.so" label = hardLimiter '
+            f'control = {{ "dB limit" = {s["l_thr"]:.1f} "Wet level" = 1.0 "Residue level" = 0.0 }} }}'
+        )
+        order.append(("limiter", "Output", "Input"))
+
+    if not order:
+        nodes.append(
+            '                    { type = builtin name = pass label = bq_lowpass '
+            'control = { "Freq" = 20000.0 "Q" = 0.7 } }'
+        )
+        order.append(("pass", "Out", "In"))
+
+    for i in range(len(order) - 1):
+        prev, out_port, _ = order[i]
+        nxt, _, in_port = order[i + 1]
+        links.append(f'                    {{ output = "{prev}:{out_port}" input = "{nxt}:{in_port}" }}')
+
+    target = f'\n                node.target  = "{s["input"]}"' if s.get("input") else ""
+    return f'''# Généré par micro-traite-gui - ne pas éditer à la main
+context.modules = [
+    {{ name = libpipewire-module-filter-chain
+        flags = [ nofail ]
+        args = {{
+            node.description = "Micro Traité"
+            media.name       = "Micro Traité"
+            filter.graph = {{
+                nodes = [
+{chr(10).join(nodes)}
+                ]
+                links = [
+{chr(10).join(links)}
+                ]
+            }}
+            audio.channels = 1
+            audio.position = [ MONO ]
+            capture.props = {{
+                node.name    = "capture.micro-traite"{target}
+                node.passive = true
+            }}
+            playback.props = {{
+                node.name    = "micro-traite"
+                media.class  = Audio/Source
+            }}
+        }}
+    }}
+]
+'''
+
+
+def write_conf(s):
+    os.makedirs(CONF_DIR, exist_ok=True)
+    with open(CONF_PATH, "w") as f:
+        f.write(build_conf(s))
+    with open(STATE_PATH, "w") as f:
+        json.dump(s, f, indent=2)
+    return CONF_PATH
+
+
+class MicroTraiteApp(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="Micro Traité")
+        self.set_border_width(10)
+        self.set_default_size(460, 640)
+        self.set_resizable(False)
+
+        self.s = load_state()
+        self._sources = list_sources()
+        resolve_input(self.s, self._sources)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.add(scroll)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        scroll.add(outer)
+
+        outer.pack_start(self._section_title("Micro d'entrée"), False, False, 0)
+        self.combo = Gtk.ComboBoxText()
+        for name, desc in self._sources:
+            self.combo.append(name, desc)
+        if self._sources:
+            self.combo.set_active_id(self.s["input"])
+        outer.pack_start(self.combo, False, False, 0)
+        outer.pack_start(Gtk.Separator(), False, False, 0)
+
+        self.chk_noise = Gtk.CheckButton(label="Suppression du bruit (RNNoise)")
+        self.chk_noise.set_active(self.s["noise"])
+        outer.pack_start(self.chk_noise, False, False, 0)
+        self.vad = self._slider(outer, "Voix (VAD)", 0, 99, 1, self.s["vad"], " %")
+        self.grace = self._slider(outer, "Maintien fin de mot", 0, 1000, 10, self.s["grace"], " ms")
+        outer.pack_start(Gtk.Separator(), False, False, 0)
+
+        self.chk_eq = Gtk.CheckButton(label="Égaliseur")
+        self.chk_eq.set_active(self.s["eq"])
+        outer.pack_start(self.chk_eq, False, False, 0)
+        self.hp = self._slider(outer, "Coupe-bas", 40, 200, 5, self.s["hp_freq"], " Hz")
+        self.bass = self._slider(outer, "Basses (110 Hz)", -6, 6, 0.5, self.s["bass"], " dB")
+        self.mud = self._slider(outer, "Bas-médium (350 Hz)", -8, 4, 0.5, self.s["mud"], " dB")
+        self.pres = self._slider(outer, "Présence (2,5 kHz)", -4, 6, 0.5, self.s["pres"], " dB")
+        outer.pack_start(Gtk.Separator(), False, False, 0)
+
+        self.chk_comp = Gtk.CheckButton(label="Compresseur")
+        self.chk_comp.set_active(self.s["comp"])
+        outer.pack_start(self.chk_comp, False, False, 0)
+        self.c_thr = self._slider(outer, "Seuil", -40, 0, 1, self.s["c_thr"], " dB")
+        self.c_ratio = self._slider(outer, "Ratio", 1, 10, 0.5, self.s["c_ratio"], " : 1")
+        self.c_att = self._slider(outer, "Attaque", 1, 50, 1, self.s["c_att"], " ms")
+        self.c_rel = self._slider(outer, "Relâchement", 20, 500, 10, self.s["c_rel"], " ms")
+        self.c_makeup = self._slider(outer, "Gain sortie", 0, 12, 0.5, self.s["c_makeup"], " dB")
+        outer.pack_start(Gtk.Separator(), False, False, 0)
+
+        self.chk_lim = Gtk.CheckButton(label="Limiteur")
+        self.chk_lim.set_active(self.s["limiter"])
+        outer.pack_start(self.chk_lim, False, False, 0)
+        self.l_thr = self._slider(outer, "Seuil", -12, 0, 0.5, self.s["l_thr"], " dB")
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        outer.pack_start(row, False, False, 0)
+        btn_def = Gtk.Button(label="Défaut")
+        btn_def.connect("clicked", self.on_default)
+        row.pack_start(btn_def, True, True, 0)
+        btn_apply = Gtk.Button(label="Appliquer")
+        btn_apply.connect("clicked", self.on_apply)
+        row.pack_start(btn_apply, True, True, 0)
+
+        self.status = Gtk.Label(label="Prêt")
+        self.status.set_xalign(0)
+        self.status.set_line_wrap(True)
+        outer.pack_start(self.status, False, False, 0)
+
+    def _section_title(self, text):
+        lbl = Gtk.Label()
+        lbl.set_markup(f"<b>{text}</b>")
+        lbl.set_xalign(0)
+        return lbl
+
+    def _slider(self, parent, label, lo, hi, step, value, unit):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        parent.pack_start(box, False, False, 0)
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        box.pack_start(header, False, False, 0)
+        lab = Gtk.Label(label=label)
+        lab.set_xalign(0)
+        header.pack_start(lab, True, True, 0)
+        val = Gtk.Label()
+        val.set_xalign(1)
+        header.pack_start(val, False, False, 0)
+        adj = Gtk.Adjustment(value=value, lower=lo, upper=hi, step_increment=step, page_increment=step * 5)
+        scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=adj)
+        scale.set_hexpand(True)
+
+        def fmt(sc):
+            v = sc.get_value()
+            val.set_text(f"{int(v)}{unit}" if step >= 1 else f"{v:.1f}{unit}")
+
+        scale.connect("value-changed", fmt)
+        fmt(scale)
+        box.pack_start(scale, False, False, 0)
+        return scale
+
+    def gather(self):
+        self.s["noise"] = self.chk_noise.get_active()
+        self.s["vad"] = self.vad.get_value()
+        self.s["grace"] = self.grace.get_value()
+        self.s["eq"] = self.chk_eq.get_active()
+        self.s["hp_freq"] = self.hp.get_value()
+        self.s["bass"] = self.bass.get_value()
+        self.s["mud"] = self.mud.get_value()
+        self.s["pres"] = self.pres.get_value()
+        self.s["comp"] = self.chk_comp.get_active()
+        self.s["c_thr"] = self.c_thr.get_value()
+        self.s["c_ratio"] = self.c_ratio.get_value()
+        self.s["c_att"] = self.c_att.get_value()
+        self.s["c_rel"] = self.c_rel.get_value()
+        self.s["c_makeup"] = self.c_makeup.get_value()
+        self.s["limiter"] = self.chk_lim.get_active()
+        self.s["l_thr"] = self.l_thr.get_value()
+        if self.combo.get_active_id():
+            self.s["input"] = self.combo.get_active_id()
+
+    def on_default(self, _b):
+        for k, v in DEFAULTS.items():
+            if k == "input":
+                resolve_input(self.s, self._sources)
+                if self.s["input"]:
+                    self.combo.set_active_id(self.s["input"])
+                continue
+            w = {
+                "noise": self.chk_noise, "vad": self.vad, "grace": self.grace,
+                "eq": self.chk_eq, "hp_freq": self.hp, "bass": self.bass, "mud": self.mud, "pres": self.pres,
+                "comp": self.chk_comp, "c_thr": self.c_thr, "c_ratio": self.c_ratio,
+                "c_att": self.c_att, "c_rel": self.c_rel, "c_makeup": self.c_makeup,
+                "limiter": self.chk_lim, "l_thr": self.l_thr,
+            }.get(k)
+            if isinstance(w, Gtk.CheckButton):
+                w.set_active(v)
+            elif w is not None:
+                w.set_value(v)
+        self.status.set_text("Valeurs par défaut chargées (pense à Appliquer)")
+
+    def on_apply(self, _b):
+        self.gather()
+        try:
+            write_conf(self.s)
+        except Exception as e:
+            self.status.set_text(f"Erreur écriture : {e}")
+            return
+        self.status.set_text("Application… rechargement de PipeWire")
+        GLib.timeout_add(100, self._restart)
+
+    def _restart(self):
+        try:
+            subprocess.run(["systemctl", "--user", "restart", "pipewire.service"],
+                           capture_output=True, text=True, timeout=15)
+            self.status.set_text("Appliqué. Le micro « Micro Traité » est rechargé.")
+        except Exception as e:
+            self.status.set_text(f"Échec du rechargement : {e}")
+        return False
+
+
+def main_cli():
+    s = load_state()
+    resolve_input(s)
+    path = write_conf(s)
+    print(f"Configuration écrite : {path}")
+    if not s.get("input"):
+        print("Aucun micro détecté : lance l'interface pour choisir l'entrée.")
+
+
+def main():
+    if "--write-conf" in sys.argv:
+        main_cli()
+        return
+    if "-h" in sys.argv or "--help" in sys.argv:
+        print(__doc__)
+        return
+    win = MicroTraiteApp()
+    win.connect("destroy", Gtk.main_quit)
+    win.show_all()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()
