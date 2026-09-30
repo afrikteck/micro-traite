@@ -72,7 +72,7 @@ puis recharge PipeWire (≈ 1 s de coupure audio).
 | RNNoise | VAD | 50 % |
 | RNNoise | Maintien fin de mot | 120 ms |
 | EQ | Coupe-bas | 55 Hz |
-| EQ | Corps (low-shelf 90 Hz) | +1,5 dB |
+| EQ | Corps (low-shelf 90 Hz) | +2 dB |
 | EQ | Creux « carton » 280 Hz | -2,5 dB |
 | EQ | Bas-médium 400 Hz | -1 dB |
 | EQ | Présence 2,5 kHz | +3,5 dB |
@@ -80,7 +80,7 @@ puis recharge PipeWire (≈ 1 s de coupure audio).
 | EQ | Sifflantes 7 kHz | -1,5 dB |
 | EQ | Air (high-shelf 12 kHz) | +1,5 dB |
 | Comp. 1 (nivelage) | Seuil / Ratio / Attaque / Relâchement / Gain | -22 dB / 2:1 / 20 ms / 250 ms / +2 dB |
-| Comp. 2 (crêtes) | Seuil / Ratio / Gain | -10 dB / 4:1 / +1 dB |
+| Comp. 2 (crêtes) | Seuil / Ratio / Gain | -10 dB / 4:1 / +4 dB |
 | Limiteur | Seuil | -1,5 dB |
 
 > Astuce : un micro **proche (15–25 cm)**, légèrement de biais, avec un
