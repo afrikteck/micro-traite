@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Micro Traité - interface GTK3 pour piloter une chaîne audio PipeWire.
 
-Chaîne : RNNoise -> Égaliseur -> Compresseur -> Limiteur
+Chaîne "broadcast" inspirée des micros studio (coupe-bas, corps, creux carton,
+présence, clarté, sifflantes, air, compression 2 étages, limiteur).
 Sortie : source virtuelle « Micro Traité » utilisable dans toutes les applis.
 
-Le programme génère ~/.config/pipewire/pipewire.conf.d/micro-prepro.conf
-puis recharge PipeWire. Usage :
-
+Usage :
     micro-traite-gui              # interface graphique
     micro-traite-gui --write-conf # écrit la conf sans interface (install)
 """
@@ -25,12 +24,18 @@ CONF_DIR = os.path.join(HOME, ".config", "pipewire", "pipewire.conf.d")
 CONF_PATH = os.path.join(CONF_DIR, "micro-prepro.conf")
 STATE_PATH = os.path.join(HOME, ".config", "micro-traite-gui.json")
 RNNOISE_PLUGIN = "/usr/lib/ladspa/librnnoise_ladspa.so"
+SC4M = "/usr/lib/ladspa/sc4m_1916.so"
+HARDLIM = "/usr/lib/ladspa/hard_limiter_1413.so"
 
 DEFAULTS = {
     "input": "",
-    "noise": True, "vad": 50, "grace": 100,
-    "eq": True, "hp_freq": 80, "bass": 3.0, "mud": -3.0, "pres": 2.5,
-    "comp": True, "c_thr": -18, "c_ratio": 3.0, "c_att": 8, "c_rel": 150, "c_makeup": 2.0,
+    "noise": True, "vad": 50, "grace": 120,
+    "eq": True, "hp_freq": 55,
+    "corps": 1.5, "box": -2.5, "mud": -1.0,
+    "pres": 3.5, "intel": 2.5, "sib": -1.5, "air": 1.5,
+    "comp": True,
+    "c1_thr": -22, "c1_ratio": 2.0, "c1_att": 20, "c1_rel": 250, "c1_makeup": 2.0,
+    "c2_thr": -10, "c2_ratio": 4.0, "c2_makeup": 1.0,
     "limiter": True, "l_thr": -1.5,
 }
 
@@ -89,45 +94,46 @@ def build_conf(s):
         order.append(("rnnoise", "Output", "Input"))
 
     if s["eq"]:
-        nodes.append(
-            '                    { type = builtin name = hp label = bq_highpass '
-            f'control = {{ "Freq" = {s["hp_freq"]}.0 "Q" = 0.707 }} }}'
-        )
-        nodes.append(
-            '                    { type = builtin name = bass label = bq_peaking '
-            f'control = {{ "Freq" = 110.0 "Q" = 0.7 "Gain" = {s["bass"]:.2f} }} }}'
-        )
-        nodes.append(
-            '                    { type = builtin name = mud label = bq_peaking '
-            f'control = {{ "Freq" = 350.0 "Q" = 1.2 "Gain" = {s["mud"]:.2f} }} }}'
-        )
-        nodes.append(
-            '                    { type = builtin name = pres label = bq_peaking '
-            f'control = {{ "Freq" = 2500.0 "Q" = 0.7 "Gain" = {s["pres"]:.2f} }} }}'
-        )
-        order += [("hp", "Out", "In"), ("bass", "Out", "In"),
-                  ("mud", "Out", "In"), ("pres", "Out", "In")]
+        def bq(name, label, freq, gain=None, q=0.9):
+            extra = f' "Gain" = {gain:.2f}' if gain is not None else ""
+            nodes.append(
+                f'                    {{ type = builtin name = {name} label = {label} '
+                f'control = {{ "Freq" = {float(freq):.1f} "Q" = {float(q):.3f}{extra} }} }}'
+            )
+        bq("hp", "bq_highpass", s["hp_freq"], q=0.707)
+        bq("corps", "bq_lowshelf", 90.0, s["corps"], q=0.707)
+        bq("box", "bq_peaking", 280.0, s["box"], q=1.0)
+        bq("mud", "bq_peaking", 400.0, s["mud"], q=1.0)
+        bq("pres", "bq_peaking", 2500.0, s["pres"], q=0.9)
+        bq("intel", "bq_peaking", 5000.0, s["intel"], q=0.9)
+        bq("sib", "bq_peaking", 7000.0, s["sib"], q=2.0)
+        bq("air", "bq_highshelf", 12000.0, s["air"], q=0.707)
+        order += [("hp", "Out", "In"), ("corps", "Out", "In"), ("box", "Out", "In"),
+                  ("mud", "Out", "In"), ("pres", "Out", "In"), ("intel", "Out", "In"),
+                  ("sib", "Out", "In"), ("air", "Out", "In")]
 
     if s["comp"]:
-        nodes.append(
-            '                    { type = ladspa name = comp '
-            'plugin = "/usr/lib/ladspa/sc4m_1916.so" label = sc4m\n'
-            '                      control = {\n'
-            '                        "RMS/peak" = 0.0\n'
-            f'                        "Attack time (ms)" = {int(s["c_att"])}.0\n'
-            f'                        "Release time (ms)" = {int(s["c_rel"])}.0\n'
-            f'                        "Threshold level (dB)" = {s["c_thr"]:.1f}\n'
-            f'                        "Ratio (1:n)" = {s["c_ratio"]:.1f}\n'
-            '                        "Knee radius (dB)" = 3.0\n'
-            f'                        "Makeup gain (dB)" = {s["c_makeup"]:.1f}\n'
-            '                      } }'
-        )
-        order.append(("comp", "Output", "Input"))
+        def sc4m(name, thr, ratio, att, rel, makeup, knee, rms):
+            nodes.append(
+                f'                    {{ type = ladspa name = {name} plugin = "{SC4M}" label = sc4m\n'
+                '                      control = {\n'
+                f'                        "RMS/peak" = {rms}\n'
+                f'                        "Attack time (ms)" = {att}.0\n'
+                f'                        "Release time (ms)" = {rel}.0\n'
+                f'                        "Threshold level (dB)" = {thr:.1f}\n'
+                f'                        "Ratio (1:n)" = {ratio:.1f}\n'
+                f'                        "Knee radius (dB)" = {knee}.0\n'
+                f'                        "Makeup gain (dB)" = {makeup:.1f}\n'
+                '                      } }'
+            )
+        sc4m("comp1", s["c1_thr"], s["c1_ratio"], int(s["c1_att"]), int(s["c1_rel"]), s["c1_makeup"], 6, 1.0)
+        sc4m("comp2", s["c2_thr"], s["c2_ratio"], 5, 100, s["c2_makeup"], 3, 0.0)
+        order += [("comp1", "Output", "Input"), ("comp2", "Output", "Input")]
 
     if s["limiter"]:
         nodes.append(
             '                    { type = ladspa name = limiter '
-            'plugin = "/usr/lib/ladspa/hard_limiter_1413.so" label = hardLimiter '
+            f'plugin = "{HARDLIM}" label = hardLimiter '
             f'control = {{ "dB limit" = {s["l_thr"]:.1f} "Wet level" = 1.0 "Residue level" = 0.0 }} }}'
         )
         order.append(("limiter", "Output", "Input"))
@@ -189,7 +195,7 @@ class MicroTraiteApp(Gtk.Window):
     def __init__(self):
         super().__init__(title="Micro Traité")
         self.set_border_width(10)
-        self.set_default_size(460, 640)
+        self.set_default_size(470, 680)
         self.set_resizable(False)
 
         self.s = load_state()
@@ -201,8 +207,9 @@ class MicroTraiteApp(Gtk.Window):
         self.add(scroll)
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         scroll.add(outer)
+        self._w = {}
 
-        outer.pack_start(self._section_title("Micro d'entrée"), False, False, 0)
+        outer.pack_start(self._title("Micro d'entrée"), False, False, 0)
         self.combo = Gtk.ComboBoxText()
         for name, desc in self._sources:
             self.combo.append(name, desc)
@@ -211,58 +218,63 @@ class MicroTraiteApp(Gtk.Window):
         outer.pack_start(self.combo, False, False, 0)
         outer.pack_start(Gtk.Separator(), False, False, 0)
 
-        self.chk_noise = Gtk.CheckButton(label="Suppression du bruit (RNNoise)")
-        self.chk_noise.set_active(self.s["noise"])
-        outer.pack_start(self.chk_noise, False, False, 0)
-        self.vad = self._slider(outer, "Voix (VAD)", 0, 99, 1, self.s["vad"], " %")
-        self.grace = self._slider(outer, "Maintien fin de mot", 0, 1000, 10, self.s["grace"], " ms")
+        self._check(outer, "noise", "Suppression du bruit (RNNoise)")
+        self._slider(outer, "vad", "Voix (VAD)", 0, 99, 1, " %")
+        self._slider(outer, "grace", "Maintien fin de mot", 0, 1000, 10, " ms")
         outer.pack_start(Gtk.Separator(), False, False, 0)
 
-        self.chk_eq = Gtk.CheckButton(label="Égaliseur")
-        self.chk_eq.set_active(self.s["eq"])
-        outer.pack_start(self.chk_eq, False, False, 0)
-        self.hp = self._slider(outer, "Coupe-bas", 40, 200, 5, self.s["hp_freq"], " Hz")
-        self.bass = self._slider(outer, "Basses (110 Hz)", -6, 6, 0.5, self.s["bass"], " dB")
-        self.mud = self._slider(outer, "Bas-médium (350 Hz)", -8, 4, 0.5, self.s["mud"], " dB")
-        self.pres = self._slider(outer, "Présence (2,5 kHz)", -4, 6, 0.5, self.s["pres"], " dB")
+        self._check(outer, "eq", "Égaliseur")
+        self._slider(outer, "hp_freq", "Coupe-bas", 40, 200, 5, " Hz")
+        self._slider(outer, "corps", "Corps (grave)", -6, 6, 0.5, " dB")
+        self._slider(outer, "box", "Creux « carton » (280 Hz)", -8, 4, 0.5, " dB")
+        self._slider(outer, "mud", "Bas-médium (400 Hz)", -6, 4, 0.5, " dB")
+        self._slider(outer, "pres", "Présence (2,5 kHz)", -4, 8, 0.5, " dB")
+        self._slider(outer, "intel", "Clarté (5 kHz)", -4, 8, 0.5, " dB")
+        self._slider(outer, "sib", "Sifflantes (7 kHz)", -8, 2, 0.5, " dB")
+        self._slider(outer, "air", "Air (12 kHz)", -4, 6, 0.5, " dB")
         outer.pack_start(Gtk.Separator(), False, False, 0)
 
-        self.chk_comp = Gtk.CheckButton(label="Compresseur")
-        self.chk_comp.set_active(self.s["comp"])
-        outer.pack_start(self.chk_comp, False, False, 0)
-        self.c_thr = self._slider(outer, "Seuil", -40, 0, 1, self.s["c_thr"], " dB")
-        self.c_ratio = self._slider(outer, "Ratio", 1, 10, 0.5, self.s["c_ratio"], " : 1")
-        self.c_att = self._slider(outer, "Attaque", 1, 50, 1, self.s["c_att"], " ms")
-        self.c_rel = self._slider(outer, "Relâchement", 20, 500, 10, self.s["c_rel"], " ms")
-        self.c_makeup = self._slider(outer, "Gain sortie", 0, 12, 0.5, self.s["c_makeup"], " dB")
+        self._check(outer, "comp", "Compression (2 étages)")
+        self._slider(outer, "c1_thr", "Nivelage — seuil", -40, 0, 1, " dB")
+        self._slider(outer, "c1_ratio", "Nivelage — ratio", 1, 10, 0.5, " : 1")
+        self._slider(outer, "c1_att", "Nivelage — attaque", 1, 50, 1, " ms")
+        self._slider(outer, "c1_rel", "Nivelage — relâchement", 20, 500, 10, " ms")
+        self._slider(outer, "c1_makeup", "Nivelage — gain", 0, 12, 0.5, " dB")
+        self._slider(outer, "c2_thr", "Crêtes — seuil", -30, 0, 1, " dB")
+        self._slider(outer, "c2_ratio", "Crêtes — ratio", 1, 20, 0.5, " : 1")
+        self._slider(outer, "c2_makeup", "Crêtes — gain", 0, 12, 0.5, " dB")
         outer.pack_start(Gtk.Separator(), False, False, 0)
 
-        self.chk_lim = Gtk.CheckButton(label="Limiteur")
-        self.chk_lim.set_active(self.s["limiter"])
-        outer.pack_start(self.chk_lim, False, False, 0)
-        self.l_thr = self._slider(outer, "Seuil", -12, 0, 0.5, self.s["l_thr"], " dB")
+        self._check(outer, "limiter", "Limiteur")
+        self._slider(outer, "l_thr", "Seuil", -12, 0, 0.5, " dB")
 
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         outer.pack_start(row, False, False, 0)
-        btn_def = Gtk.Button(label="Défaut")
-        btn_def.connect("clicked", self.on_default)
-        row.pack_start(btn_def, True, True, 0)
-        btn_apply = Gtk.Button(label="Appliquer")
-        btn_apply.connect("clicked", self.on_apply)
-        row.pack_start(btn_apply, True, True, 0)
+        b1 = Gtk.Button(label="Défaut")
+        b1.connect("clicked", self.on_default)
+        row.pack_start(b1, True, True, 0)
+        b2 = Gtk.Button(label="Appliquer")
+        b2.connect("clicked", self.on_apply)
+        row.pack_start(b2, True, True, 0)
 
         self.status = Gtk.Label(label="Prêt")
         self.status.set_xalign(0)
         self.status.set_line_wrap(True)
         outer.pack_start(self.status, False, False, 0)
 
-    def _section_title(self, text):
+    def _title(self, text):
         lbl = Gtk.Label()
         lbl.set_markup(f"<b>{text}</b>")
         lbl.set_xalign(0)
         return lbl
 
-    def _slider(self, parent, label, lo, hi, step, value, unit):
+    def _check(self, parent, key, label):
+        w = Gtk.CheckButton(label=label)
+        w.set_active(self.s[key])
+        parent.pack_start(w, False, False, 0)
+        self._w[key] = w
+
+    def _slider(self, parent, key, label, lo, hi, step, unit):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         parent.pack_start(box, False, False, 0)
         header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
@@ -273,7 +285,7 @@ class MicroTraiteApp(Gtk.Window):
         val = Gtk.Label()
         val.set_xalign(1)
         header.pack_start(val, False, False, 0)
-        adj = Gtk.Adjustment(value=value, lower=lo, upper=hi, step_increment=step, page_increment=step * 5)
+        adj = Gtk.Adjustment(value=self.s[key], lower=lo, upper=hi, step_increment=step, page_increment=step * 5)
         scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=adj)
         scale.set_hexpand(True)
 
@@ -284,42 +296,25 @@ class MicroTraiteApp(Gtk.Window):
         scale.connect("value-changed", fmt)
         fmt(scale)
         box.pack_start(scale, False, False, 0)
-        return scale
+        self._w[key] = scale
 
     def gather(self):
-        self.s["noise"] = self.chk_noise.get_active()
-        self.s["vad"] = self.vad.get_value()
-        self.s["grace"] = self.grace.get_value()
-        self.s["eq"] = self.chk_eq.get_active()
-        self.s["hp_freq"] = self.hp.get_value()
-        self.s["bass"] = self.bass.get_value()
-        self.s["mud"] = self.mud.get_value()
-        self.s["pres"] = self.pres.get_value()
-        self.s["comp"] = self.chk_comp.get_active()
-        self.s["c_thr"] = self.c_thr.get_value()
-        self.s["c_ratio"] = self.c_ratio.get_value()
-        self.s["c_att"] = self.c_att.get_value()
-        self.s["c_rel"] = self.c_rel.get_value()
-        self.s["c_makeup"] = self.c_makeup.get_value()
-        self.s["limiter"] = self.chk_lim.get_active()
-        self.s["l_thr"] = self.l_thr.get_value()
+        for key, w in self._w.items():
+            if isinstance(w, Gtk.CheckButton):
+                self.s[key] = w.get_active()
+            else:
+                self.s[key] = w.get_value()
         if self.combo.get_active_id():
             self.s["input"] = self.combo.get_active_id()
 
     def on_default(self, _b):
-        for k, v in DEFAULTS.items():
-            if k == "input":
+        for key, v in DEFAULTS.items():
+            if key == "input":
                 resolve_input(self.s, self._sources)
                 if self.s["input"]:
                     self.combo.set_active_id(self.s["input"])
                 continue
-            w = {
-                "noise": self.chk_noise, "vad": self.vad, "grace": self.grace,
-                "eq": self.chk_eq, "hp_freq": self.hp, "bass": self.bass, "mud": self.mud, "pres": self.pres,
-                "comp": self.chk_comp, "c_thr": self.c_thr, "c_ratio": self.c_ratio,
-                "c_att": self.c_att, "c_rel": self.c_rel, "c_makeup": self.c_makeup,
-                "limiter": self.chk_lim, "l_thr": self.l_thr,
-            }.get(k)
+            w = self._w.get(key)
             if isinstance(w, Gtk.CheckButton):
                 w.set_active(v)
             elif w is not None:

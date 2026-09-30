@@ -14,13 +14,21 @@ minimaliste pour tout régler.
 
 ## Chaîne de traitement
 
+La chaîne par défaut vise un rendu **broadcast/studio**, inspiré des micros
+de référence (Shure SM7B, Neumann U87) : réponse plate, léger boost de
+présence, pas de bosse dans le grave.
+
 ```
 Micro (webcam / téléphone / autre)
-  └─ RNNoise            (suppression de bruit par réseau de neurones)
-      └─ Égaliseur       (coupe-bas + 3 bandes : basses / bas-médium / présence)
-          └─ Compresseur (seuil, ratio, attaque, relâchement, gain)
-              └─ Limiteur (garde-fou anti-saturation)
-                  └─ Source virtuelle « Micro Traité »
+  └─ RNNoise              (suppression de bruit par réseau de neurones)
+      └─ Coupe-bas 55 Hz  (bass-rolloff, comme le SM7B)
+          └─ Corps 90 Hz   (grave « poitrine »)
+              └─ Creux 280/400 Hz (retire l'effet « carton »)
+                  └─ Présence 2,5 kHz + clarté 5 kHz (intelligibilité)
+                      └─ Sifflantes 7 kHz (à défaut de de-esser) + air 12 kHz
+                          └─ Compression 2 étages (nivelage + crêtes)
+                              └─ Limiteur (garde-fou anti-saturation)
+                                  └─ Source virtuelle « Micro Traité »
 ```
 
 ## Prérequis
@@ -62,13 +70,21 @@ puis recharge PipeWire (≈ 1 s de coupure audio).
 | Étage | Paramètre | Valeur |
 |---|---|---|
 | RNNoise | VAD | 50 % |
-| RNNoise | Maintien fin de mot | 100 ms |
-| EQ | Coupe-bas | 80 Hz |
-| EQ | Basses 110 Hz | +3 dB |
-| EQ | Bas-médium 350 Hz | -3 dB |
-| EQ | Présence 2,5 kHz | +2,5 dB |
-| Compresseur | Seuil / Ratio / Attaque / Relâchement / Gain | -18 dB / 3:1 / 8 ms / 150 ms / +2 dB |
+| RNNoise | Maintien fin de mot | 120 ms |
+| EQ | Coupe-bas | 55 Hz |
+| EQ | Corps (low-shelf 90 Hz) | +1,5 dB |
+| EQ | Creux « carton » 280 Hz | -2,5 dB |
+| EQ | Bas-médium 400 Hz | -1 dB |
+| EQ | Présence 2,5 kHz | +3,5 dB |
+| EQ | Clarté 5 kHz | +2,5 dB |
+| EQ | Sifflantes 7 kHz | -1,5 dB |
+| EQ | Air (high-shelf 12 kHz) | +1,5 dB |
+| Comp. 1 (nivelage) | Seuil / Ratio / Attaque / Relâchement / Gain | -22 dB / 2:1 / 20 ms / 250 ms / +2 dB |
+| Comp. 2 (crêtes) | Seuil / Ratio / Gain | -10 dB / 4:1 / +1 dB |
 | Limiteur | Seuil | -1,5 dB |
+
+> Astuce : un micro **proche (15–25 cm)**, légèrement de biais, avec un
+> **filtre anti-pop**, apporte autant que le traitement logiciel.
 
 ## Ligne de commande
 
