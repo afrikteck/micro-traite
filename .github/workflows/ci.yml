@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: Lint (shell + python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dépendances
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y shellcheck python3-gi gir1.2-gtk-3.0
+
+      - name: ShellCheck
+        run: shellcheck install.sh uninstall.sh
+
+      - name: Syntaxe bash
+        run: |
+          bash -n install.sh
+          bash -n uninstall.sh
+
+      - name: Syntaxe Python
+        run: python3 -m py_compile bin/micro-traite-gui
+
+      - name: Aide de l'interface
+        run: python3 bin/micro-traite-gui --help
+
+  build-rnnoise:
+    name: Compilation du plugin RNNoise
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dépendances de build
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y git cmake make gcc g++
+
+      - name: Build LADSPA
+        run: |
+          git clone --depth 1 --recurse-submodules --shallow-submodules \
+            https://github.com/werman/noise-suppression-for-voice.git /tmp/nsfv
+          cmake -S /tmp/nsfv -B /tmp/nsfv/build -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTS=OFF -DBUILD_VST_PLUGIN=OFF -DBUILD_VST3_PLUGIN=OFF \
+            -DBUILD_LV2_PLUGIN=OFF -DBUILD_LADSPA_PLUGIN=ON \
+            -DBUILD_AU_PLUGIN=OFF -DBUILD_AUV3_PLUGIN=OFF
+          cmake --build /tmp/nsfv/build -j"$(nproc)"
+          test -f /tmp/nsfv/build/bin/ladspa/librnnoise_ladspa.so
+          echo "Plugin RNNoise compilé avec succès"
